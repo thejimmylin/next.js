@@ -1,3 +1,5 @@
+#![feature(arbitrary_self_types)]
+
 use std::{collections::HashMap, path::PathBuf};
 
 use next_visitor_cjs_finder::contains_cjs;
@@ -54,6 +56,48 @@ struct ReactServerComponents<C: Comments> {
 struct ModuleImports {
     source: (JsWord, Span),
     specifiers: Vec<(JsWord, Span)>,
+}
+
+enum RSCErrorKind {
+    NextRscErrServerImport((String, Span)),
+}
+
+impl<C: Comments> ReactServerComponents<C> {
+    /// Consolidated place to parse, generate error messages for the RSC parsing
+    /// errors.
+    fn report_error(&self, error_kind: RSCErrorKind) {
+        let (msg, formatted_verbose_message, span) = match error_kind {
+            RSCErrorKind::NextRscErrServerImport((source, span)) => {
+                let (should_append_use_client, msg) = match source.as_str() {
+                    // If importing "react-dom/server", we should show a different error.
+                    "react-dom/server" => (true,"You're importing a component that imports react-dom/server. To fix it, render or return the content directly as a Server Component instead for perf and security.\nLearn more: https://nextjs.org/docs/getting-started/react-essentials".to_string()),
+                    // If importing "next/router", we should tell them to use "next/navigation".
+                    "next/router" => (false, r#"You have a Server Component that imports next/router. Use next/navigation instead.\nLearn more: https://nextjs.org/docs/app/api-reference/functions/use-router"#.to_string()),
+                    _ => (true, format!(r#"You're importing a component that imports {}. It only works in a Client Component but none of its parents are marked with "use client", so they're Server Components by default.\nLearn more: https://nextjs.org/docs/getting-started/react-essentials\n\n"#, source))
+                };
+
+                let formatted_verbose_message = if should_append_use_client {
+                    Some(
+                        "\n\nMaybe one of these should be marked as a client entry \"use \
+                         client\":\n"
+                            .to_string(),
+                    )
+                } else {
+                    Some("\n\nImport trace:\n".to_string())
+                };
+
+                (msg, formatted_verbose_message, span)
+            }
+        };
+
+        let msg = vec![Some(msg), formatted_verbose_message]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        HANDLER.with(|handler| handler.struct_span_err(span, msg.as_str()).emit())
+    }
 }
 
 impl<C: Comments> VisitMut for ReactServerComponents<C> {
@@ -349,14 +393,10 @@ impl<C: Comments> ReactServerComponents<C> {
         for import in imports {
             let source = import.source.0.clone();
             if self.invalid_server_imports.contains(&source) {
-                HANDLER.with(|handler| {
-                    handler
-                        .struct_span_err(
-                            import.source.1,
-                            format!("NEXT_RSC_ERR_SERVER_IMPORT: {}", source).as_str(),
-                        )
-                        .emit()
-                })
+                self.report_error(RSCErrorKind::NextRscErrServerImport((
+                    source.to_string(),
+                    import.source.1,
+                )));
             }
             if source == *"react" {
                 for specifier in &import.specifiers {
